@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# 1. Проверка входящего аргумента
+ARG=$1
+
+if [ -z "$ARG" ]; then
+    echo "Ошибка: Передайте обязательный аргумент (строку из букв и цифр)."
+    echo "Пример использования: compress_all_v0 152Ha33"
+    exit 1
+fi
+
+if [[ ! "$ARG" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "Ошибка: Аргумент содержит недопустимые символы."
+    echo "Разрешены только латинские буквы, цифры, дефис и нижнее подчеркивание."
+    exit 1
+fi
+
+# ФУНКЦИЯ ОБЁРТКА (Логика всего скрипта, которую мы ниже перенаправим в файл и на экран)
+main_process() {
+    CURRENT_DIR=$(pwd)
+
+    echo "=== Старт сессии сжатия: $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "Запуск сервера сжатия..."
+    # УКАЖИТЕ ЗДЕСЬ ВАШ ТОЧНЫЙ ПУТЬ К ПАПКЕ СЕРВЕРА
+    cd "/cygdrive/c/jpg-compress" || exit 1
+    node server.js &
+    SERVER_PID=$!
+
+    cd "$CURRENT_DIR"
+    sleep 3
+
+    TARGET_DIR="compress jpg"
+    mkdir -p "$TARGET_DIR"
+
+    # Инициализируем текстовый лог (требование из прошлых шагов)
+    COMP_LOG="${TARGET_DIR}/compression_log.txt"
+    > "$COMP_LOG"
+
+    shopt -s nocaseglob
+
+    # ===== ИСПРАВЛЕНИЕ: Лексикографическая сортировка =====
+    # Собираем файлы в массив, затем сортируем
+    FILES=()
+    for f in *.jpg *.jpeg; do
+        [ -f "$f" ] && FILES+=("$f")
+    done
+    
+    # Сортируем массив лексикографически (с учетом регистра)
+    # Используем sort с флагом -V для естественной сортировки (1, 2, 10, 11...)
+    # Или -n для числовой, или просто без флагов для обычной лексикографической
+    readarray -t FILES < <(printf '%s\n' "${FILES[@]}" | sort -V)
+    
+    shopt -u nocaseglob
+
+    if [ ${#FILES[@]} -eq 0 ]; then
+        echo "В текущем каталоге не найдено JPG/JPEG файлов."
+        kill $SERVER_PID
+        exit 0
+    fi
+
+    echo "Найдено файлов для обработки: ${#FILES[@]}"
+    echo "Файлы будут обработаны в следующем порядке:"
+    # Показываем первые 5 файлов для примера
+    for i in "${!FILES[@]}"; do
+        if [ $i -lt 5 ]; then
+            echo "  $((i+1)). ${FILES[$i]}"
+        elif [ $i -eq 5 ]; then
+            echo "  ..."
+            break
+        fi
+    done
+    
+    echo "Запуск пула параллельной обработки (макс. 4 потока)..."
+
+    # Экспортируем переменные и функцию для утилиты xargs
+    export TARGET_DIR ARG COMP_LOG
+    
+    do_compress() {
+        local file=$1
+        local counter=$2
+        
+        local ext="${file##*.}"
+        local ext_lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+        local file_time=$(date "+%Y-%m-%d--%H-%M")
+        # local file_time=$(date "+%Y-%m-%d--%H-%M-%S")
+        local inc_file=$(printf "%02d" "$counter")
+        local new_name="compress__${ARG}--${file_time}--${inc_file}.00.${ext_lower}"
+        
+        echo "--> Сжатие: $file -> $new_name"
+        
+        # Запрос curl с ограничением по времени (таймаут 15 сек), чтобы не вис вечно
+        curl -s -m 15 -X POST -H "Content-Type: image/jpeg" \
+            --data-binary @"$file" \
+            http://localhost:3000/compress \
+            -o "${TARGET_DIR}/${new_name}"
+        
+        if [ $? -eq 0 ]; then
+            local log_time=$(date "+%Y-%m-%d %H:%M:%S")
+            local inc_log=$(printf "%05d" "$counter")
+            # Безопасная запись в лог (xargs гарантирует атомарность строк)
+            printf "%s, %s, %s\n" "$inc_log" "$new_name" "$log_time" >> "$COMP_LOG"
+        else
+            echo "    [ОШИБКА] Не удалось сжать файл: $file"
+        fi
+        
+        # Микропауза для уникальности секунд в именах файлов
+        sleep 0.2
+    }
+    export -f do_compress
+
+    # Генерация списка задач для xargs: передаем "имя_файла номер" построчно
+    local idx=0
+    for file in "${FILES[@]}"; do
+        ((idx++))
+        echo "$file" "$idx"
+    done | xargs -P 4 -n 2 bash -c 'do_compress "$0" "$1"'
+
+    echo "Все фотографии обработаны!"
+    echo "Системный лог сохранен в: $COMP_LOG"
+    
+    echo "Остановка сервера сжатия..."
+    kill $SERVER_PID
+    wait $SERVER_PID 2>/dev/null
+    echo "=== Сессия успешно завершена ==="
+}
+
+# КЛЮЧЕВОЙ МОМЕНТ: Запускаем основную функцию, дублируя весь вывод на экран 
+# и автоматически записывая в файл "${ARG}_compress_log.txt"
+main_process 2>&1 | tee "${ARG}_compress_log.txt"
